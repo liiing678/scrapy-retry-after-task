@@ -1,0 +1,10 @@
+项目：Scrapy
+公开仓库：https://github.com/scrapy/scrapy
+基线版本：2.13.3
+上游完整提交：155a504f24b9dd180b8786a4fa709f87cfe8fb66
+固定来源：https://github.com/scrapy/scrapy/commit/155a504f24b9dd180b8786a4fa709f87cfe8fb66
+上游提交时间：2025-07-02T15:39:46Z
+许可证：BSD-3-Clause，原 LICENSE 和 AUTHORS 保留在仓库根目录。
+
+本题在该公开版本上提出功能扩展，不是声称上游已接受的需求或尚未修复的缺陷报告。初始快照仅新增根目录 prompt.txt、task_materials/ 和运行文件忽略项；scrapy/、tests/、docs/ 中的上游代码保持原样。
+本地复现站点与探针是自建合成输入，只访问127.0.0.1，不包含真实凭据、外部站点抓取内容或目标功能答案。

@@ -29,3 +29,8 @@ Thumbs.db
 
 # OSX miscellaneous
 .DS_Store
+
+# Local task runs and credentials
+.env
+.env.*
+/task_materials/results/
