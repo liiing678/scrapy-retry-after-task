@@ -1,0 +1,7 @@
+pytest==8.4.2
+Twisted==25.5.0
+hatchling==1.27.0
+testfixtures==8.3.0
+pywin32==311; sys_platform == 'win32'
+editables==0.5
+w3lib==2.3.1

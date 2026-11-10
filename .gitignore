@@ -29,3 +29,10 @@ Thumbs.db
 
 # OSX miscellaneous
 .DS_Store
+
+# Local task runtime outputs
+__pycache__/
+/.scrapy/
+/.env
+/.env.*
+/task-output/
