@@ -29,3 +29,12 @@ Thumbs.db
 
 # OSX miscellaneous
 .DS_Store
+
+# Local task execution artifacts and credentials
+__pycache__/
+/task/results/
+/task/runs/
+.env
+.env.*
+*.pem
+*.pfx
