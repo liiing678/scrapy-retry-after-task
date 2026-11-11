@@ -417,6 +417,7 @@ These are the settings used for configuring the feed exports:
 -   :setting:`FEED_STORAGE_S3_ACL`
 -   :setting:`FEED_EXPORTERS`
 -   :setting:`FEED_EXPORT_BATCH_ITEM_COUNT`
+-   :setting:`FEED_EXPORT_MAX_PENDING_BATCHES`
 
 .. currentmodule:: scrapy.extensions.feedexport
 
@@ -741,6 +742,31 @@ The command line above can generate a directory tree like::
 
 Where the first and second files contain exactly 100 items. The last one contains
 100 items or fewer.
+
+
+.. setting:: FEED_EXPORT_MAX_PENDING_BATCHES
+
+FEED_EXPORT_MAX_PENDING_BATCHES
+-------------------------------
+
+.. versionadded:: VERSION
+
+Default: ``0``
+
+The maximum number of feed batches of a crawler, across all its feeds,
+that have been closed but not yet stored at any given time.
+
+This setting only applies to feeds split into batches, see
+:setting:`FEED_EXPORT_BATCH_ITEM_COUNT`.
+
+When the limit is reached, the crawler stops processing new items until
+the storage of a pending batch finishes, whether it succeeds or fails.
+This applies backpressure to the item pipeline so that a slow storage
+does not cause an ever-growing backlog of batches waiting to be stored.
+
+``0`` means no limit: batches are closed and handed over to the storage
+as soon as they are full, no matter how many previous batches are still
+being stored.
 
 
 .. setting:: FEED_URI_PARAMS

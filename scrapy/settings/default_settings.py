@@ -159,6 +159,7 @@ FEED_STORAGES_BASE = {
     "stdout": "scrapy.extensions.feedexport.StdoutFeedStorage",
 }
 FEED_EXPORT_BATCH_ITEM_COUNT = 0
+FEED_EXPORT_MAX_PENDING_BATCHES = 0
 FEED_EXPORTERS = {}
 FEED_EXPORTERS_BASE = {
     "json": "scrapy.exporters.JsonItemExporter",

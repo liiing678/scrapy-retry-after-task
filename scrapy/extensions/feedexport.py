@@ -448,8 +448,6 @@ class FeedSlot:
 
 
 class FeedExporter:
-    _pending_deferreds: list[Deferred[None]] = []
-
     @classmethod
     def from_crawler(cls, crawler: Crawler) -> Self:
         exporter = cls(crawler)
@@ -464,6 +462,20 @@ class FeedExporter:
         self.feeds = {}
         self.slots: list[FeedSlot] = []
         self.filters: dict[str, ItemFilter] = {}
+        # Deferreds of closed batches whose storage has not finished yet.
+        self._pending_deferreds: list[Deferred[None]] = []
+        max_pending_batches: int = self.settings.getint(
+            "FEED_EXPORT_MAX_PENDING_BATCHES"
+        )
+        self._max_pending_batches: int | None = (
+            max_pending_batches if max_pending_batches > 0 else None
+        )
+        # Deferreds of batch closings waiting for a pending store to
+        # finish, and of the ongoing batch closing, if any. While a batch
+        # closing waits for storage capacity, new items must wait for the
+        # next batch to open instead of being exported into the full one.
+        self._storage_waiters: list[Deferred[None]] = []
+        self._sealing: Deferred[Any] | None = None
 
         if not self.settings["FEEDS"] and not self.settings["FEED_URI"]:
             raise NotConfigured
@@ -569,9 +581,15 @@ class FeedExporter:
                 signals.feed_slot_closed, slot=slot
             )
         )
-        d.addBoth(lambda _: self._pending_deferreds.remove(d))
+        d.addBoth(self._finish_pending_store, d)
 
         return d
+
+    def _finish_pending_store(self, result: Any, d: Deferred[None]) -> Any:
+        self._pending_deferreds.remove(d)
+        if self._storage_waiters:
+            self._storage_waiters.pop(0).callback(None)
+        return result
 
     def _handle_store_error(
         self, f: Failure, logmsg: str, spider: Spider, slot_type: str
@@ -625,13 +643,17 @@ class FeedExporter:
             crawler=self.crawler,
         )
 
-    def item_scraped(self, item: Any, spider: Spider) -> None:
-        slots = []
+    def item_scraped(self, item: Any, spider: Spider) -> Deferred[Any] | None:
+        if self._sealing is not None:
+            # A batch closing is waiting for storage capacity. Handle the
+            # item once the next batch is open. The returned Deferreds of
+            # waiting items keep the item pipeline busy, so that backpressure
+            # propagates to the spider instead of items piling up.
+            return self._sealing.addCallback(lambda _: self.item_scraped(item, spider))
+
+        slots_to_close: list[FeedSlot] = []
         for slot in self.slots:
             if not slot.filter.accepts(item):
-                slots.append(
-                    slot
-                )  # if slot doesn't accept item, continue with next slot
                 continue
 
             slot.start_exporting()
@@ -643,22 +665,57 @@ class FeedExporter:
                 self.feeds[slot.uri_template]["batch_item_count"]
                 and slot.itemcount >= self.feeds[slot.uri_template]["batch_item_count"]
             ):
-                uri_params = self._get_uri_params(
-                    spider, self.feeds[slot.uri_template]["uri_params"], slot
-                )
-                self._close_slot(slot, spider)
-                slots.append(
-                    self._start_new_batch(
-                        batch_id=slot.batch_id + 1,
-                        uri=slot.uri_template % uri_params,
-                        feed_options=self.feeds[slot.uri_template],
-                        spider=spider,
-                        uri_template=slot.uri_template,
-                    )
-                )
-            else:
-                slots.append(slot)
-        self.slots = slots
+                slots_to_close.append(slot)
+
+        sealing: list[Deferred[None]] = []
+        for slot in slots_to_close:
+            d = self._close_slot_and_start_new_batch(slot, spider)
+            if d is not None:
+                sealing.append(d)
+        if not sealing:
+            return None
+        result: Deferred[Any] = DeferredList(sealing)
+        self._sealing = result
+        result.addBoth(self._reset_sealing)
+        return result
+
+    def _reset_sealing(self, result: Any) -> Any:
+        self._sealing = None
+        return result
+
+    def _close_slot_and_start_new_batch(
+        self, slot: FeedSlot, spider: Spider
+    ) -> Deferred[None] | None:
+        """Close *slot* and open the next batch of its feed.
+
+        When the number of closed batches waiting to be stored reaches
+        FEED_EXPORT_MAX_PENDING_BATCHES, wait for one of those stores to
+        finish first and return a Deferred that fires once the new batch
+        is open.
+        """
+        if not self._storage_capacity_available():
+            d: Deferred[None] = Deferred()
+            self._storage_waiters.append(d)
+            d.addCallback(lambda _: self._close_slot_and_start_new_batch(slot, spider))
+            return d
+        uri_params = self._get_uri_params(
+            spider, self.feeds[slot.uri_template]["uri_params"], slot
+        )
+        self._close_slot(slot, spider)
+        self.slots[self.slots.index(slot)] = self._start_new_batch(
+            batch_id=slot.batch_id + 1,
+            uri=slot.uri_template % uri_params,
+            feed_options=self.feeds[slot.uri_template],
+            spider=spider,
+            uri_template=slot.uri_template,
+        )
+        return None
+
+    def _storage_capacity_available(self) -> bool:
+        return (
+            self._max_pending_batches is None
+            or len(self._pending_deferreds) < self._max_pending_batches
+        )
 
     def _load_components(self, setting_prefix: str) -> dict[str, Any]:
         conf = without_none_values(

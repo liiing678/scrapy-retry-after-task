@@ -19,13 +19,13 @@ from pathlib import Path
 from string import ascii_letters, digits
 from typing import TYPE_CHECKING, Any
 from unittest import mock
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlparse
 from urllib.request import pathname2url
 
 import lxml.etree
 import pytest
 from testfixtures import LogCapture
-from twisted.internet import defer
+from twisted.internet import defer, reactor, task
 from twisted.trial import unittest
 from w3lib.url import file_uri_to_path, path_to_file_uri
 from zope.interface import implementer
@@ -47,6 +47,7 @@ from scrapy.extensions.feedexport import (
     StdoutFeedStorage,
 )
 from scrapy.settings import Settings
+from scrapy.utils.defer import deferred_from_coro
 from scrapy.utils.python import to_unicode
 from scrapy.utils.test import get_crawler
 from tests.mockserver import MockFTPServer, MockServer
@@ -2754,6 +2755,419 @@ class TestFeedExporterSignals:
         )
         assert self.feed_slot_closed_received
         assert self.feed_exporter_closed_received
+
+
+class GatedFileFeedStorage:
+    """Storage whose stores only complete when the test releases them.
+
+    Instances with an unfinished store are queued in :attr:`gates`;
+    releasing a gate completes the corresponding store, successfully or
+    with a failure, and finished stores append ``(path, content)`` to
+    :attr:`stored`.
+    """
+
+    gates: list[GatedFileFeedStorage] = []
+    stored: list[tuple[str, bytes]] = []
+
+    def __init__(self, uri, *, feed_options=None):
+        self.path = urlparse(uri).path
+        self.gate: defer.Deferred | None = None
+
+    def open(self, spider):
+        return tempfile.TemporaryFile(prefix="feed-")
+
+    def store(self, file):
+        file.seek(0)
+        content = file.read()
+        file.close()
+        self.gate = defer.Deferred()
+        self.gate.addCallback(lambda _: type(self).stored.append((self.path, content)))
+        type(self).gates.append(self)
+        return self.gate
+
+    @classmethod
+    def reset(cls):
+        cls.gates = []
+        cls.stored = []
+
+    @classmethod
+    def release(cls, path, failure=False):
+        storage = next(storage for storage in cls.gates if storage.path == path)
+        cls.gates.remove(storage)
+        assert storage.gate is not None
+        if failure:
+            storage.gate.errback(OSError("Cannot store"))
+        else:
+            storage.gate.callback(None)
+
+
+class TestFeedExportBackpressure(unittest.TestCase):
+    """Tests for the FEED_EXPORT_MAX_PENDING_BATCHES setting."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mockserver = MockServer()
+        cls.mockserver.__enter__()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.mockserver.__exit__(None, None, None)
+
+    def setUp(self):
+        GatedFileFeedStorage.reset()
+
+    def _build_exporter(self, feeds, max_pending_batches=0):
+        settings = {
+            "FEEDS": feeds,
+            "FEED_STORAGES": {"gated": GatedFileFeedStorage},
+            "FEED_EXPORT_MAX_PENDING_BATCHES": max_pending_batches,
+        }
+        crawler = get_crawler(settings_dict=settings)
+        exporter = FeedExporter.from_crawler(crawler)
+        spider = scrapy.Spider("testspider")
+        spider.crawler = crawler
+        exporter.open_spider(spider)
+        return exporter, crawler, spider
+
+    @defer.inlineCallbacks
+    def _start_close(self, exporter, spider):
+        """Start closing *exporter* and let the close coroutine run until
+        it has to wait for pending stores."""
+        close_d = deferred_from_coro(exporter.close_spider(spider))
+        yield task.deferLater(reactor, 0)
+        return close_d
+
+    @defer.inlineCallbacks
+    def test_max_pending_batches(self):
+        exporter, crawler, spider = self._build_exporter(
+            {
+                "gated:/feeds/%(batch_id)d.jl": {
+                    "format": "jsonlines",
+                    "batch_item_count": 2,
+                }
+            },
+            max_pending_batches=2,
+        )
+        feed_exporter_closed = []
+
+        def on_feed_exporter_closed():
+            feed_exporter_closed.append(True)
+
+        crawler.signals.connect(
+            on_feed_exporter_closed,
+            signal=signals.feed_exporter_closed,
+        )
+        blocked = 0
+        for i in range(1, 13):
+            result = exporter.item_scraped({"foo": f"bar{i}"}, spider)
+            if result is None:
+                continue
+            blocked += 1
+            # 2 batches are closed and waiting to be stored, so closing
+            # another one must wait for one of those stores to finish.
+            assert len(GatedFileFeedStorage.gates) == 2
+            assert not result.called
+            GatedFileFeedStorage.release(
+                f"/feeds/{len(GatedFileFeedStorage.stored) + 1}.jl"
+            )
+            assert result.called
+        assert blocked == 4
+
+        # The close signal waits for the stores still pending.
+        close_d = yield self._start_close(exporter, spider)
+        assert not close_d.called
+        assert not feed_exporter_closed
+        GatedFileFeedStorage.release("/feeds/5.jl")
+        GatedFileFeedStorage.release("/feeds/6.jl")
+        yield close_d
+        assert feed_exporter_closed
+
+        stored = dict(GatedFileFeedStorage.stored)
+        assert sorted(stored) == [f"/feeds/{batch_id}.jl" for batch_id in range(1, 7)]
+        for batch_id in range(1, 7):
+            assert (
+                stored[f"/feeds/{batch_id}.jl"]
+                == (
+                    f'{{"foo": "bar{2 * batch_id - 1}"}}\n'
+                    f'{{"foo": "bar{2 * batch_id}"}}\n'
+                ).encode()
+            )
+        assert (
+            crawler.stats.get_value("feedexport/success_count/GatedFileFeedStorage")
+            == 6
+        )
+
+    @defer.inlineCallbacks
+    def test_items_wait_for_next_batch(self):
+        exporter, crawler, spider = self._build_exporter(
+            {
+                "gated:/feeds/%(batch_id)d.jl": {
+                    "format": "jsonlines",
+                    "batch_item_count": 2,
+                }
+            },
+            max_pending_batches=1,
+        )
+        assert exporter.item_scraped({"foo": "bar1"}, spider) is None
+        assert exporter.item_scraped({"foo": "bar2"}, spider) is None
+        assert exporter.item_scraped({"foo": "bar3"}, spider) is None
+        blocked = exporter.item_scraped({"foo": "bar4"}, spider)
+        assert blocked is not None
+        assert not blocked.called
+
+        # Items scraped while the batch closing waits for storage capacity
+        # are held back, not exported into the full batch.
+        waiting = exporter.item_scraped({"foo": "bar5"}, spider)
+        assert waiting is not None
+        assert not waiting.called
+        assert exporter.slots[0].itemcount == 2
+
+        GatedFileFeedStorage.release("/feeds/1.jl")
+        assert blocked.called
+        assert waiting.called
+        assert exporter.slots[0].batch_id == 3
+        assert exporter.slots[0].itemcount == 1
+
+        blocked = exporter.item_scraped({"foo": "bar6"}, spider)
+        assert blocked is not None
+        assert not blocked.called
+        GatedFileFeedStorage.release("/feeds/2.jl")
+        assert blocked.called
+
+        close_d = yield self._start_close(exporter, spider)
+        assert not close_d.called
+        GatedFileFeedStorage.release("/feeds/3.jl")
+        yield close_d
+        assert GatedFileFeedStorage.stored == [
+            ("/feeds/1.jl", b'{"foo": "bar1"}\n{"foo": "bar2"}\n'),
+            ("/feeds/2.jl", b'{"foo": "bar3"}\n{"foo": "bar4"}\n'),
+            ("/feeds/3.jl", b'{"foo": "bar5"}\n{"foo": "bar6"}\n'),
+        ]
+
+    @defer.inlineCallbacks
+    def test_filtered_feed_is_not_backpressured(self):
+        exporter, crawler, spider = self._build_exporter(
+            {
+                "gated:/feeds/%(batch_id)d.jl": {
+                    "format": "jsonlines",
+                    "batch_item_count": 1,
+                },
+                "gated:/rejected/%(batch_id)d.jl": {
+                    "format": "jsonlines",
+                    "batch_item_count": 1,
+                    "item_classes": (int,),
+                    "store_empty": False,
+                },
+            },
+            max_pending_batches=1,
+        )
+        # The feed whose filter rejects the item does not close batches,
+        # so only the accepting feed is subject to backpressure.
+        blocked = exporter.item_scraped({"foo": "bar1"}, spider)
+        assert blocked is None
+        blocked = exporter.item_scraped({"foo": "bar2"}, spider)
+        assert blocked is not None
+        assert not blocked.called
+        GatedFileFeedStorage.release("/feeds/1.jl")
+        assert blocked.called
+
+        close_d = yield self._start_close(exporter, spider)
+        assert not close_d.called
+        GatedFileFeedStorage.release("/feeds/2.jl")
+        yield close_d
+        assert GatedFileFeedStorage.stored == [
+            ("/feeds/1.jl", b'{"foo": "bar1"}\n'),
+            ("/feeds/2.jl", b'{"foo": "bar2"}\n'),
+        ]
+
+    @defer.inlineCallbacks
+    def test_failed_store_releases_capacity(self):
+        exporter, crawler, spider = self._build_exporter(
+            {
+                "gated:/feeds/%(batch_id)d.jl": {
+                    "format": "jsonlines",
+                    "batch_item_count": 2,
+                }
+            },
+            max_pending_batches=1,
+        )
+        assert exporter.item_scraped({"foo": "bar1"}, spider) is None
+        assert exporter.item_scraped({"foo": "bar2"}, spider) is None
+        assert exporter.item_scraped({"foo": "bar3"}, spider) is None
+        blocked = exporter.item_scraped({"foo": "bar4"}, spider)
+        assert blocked is not None
+        assert not blocked.called
+
+        GatedFileFeedStorage.release("/feeds/1.jl", failure=True)
+        assert blocked.called
+        assert (
+            crawler.stats.get_value("feedexport/failed_count/GatedFileFeedStorage") == 1
+        )
+
+        close_d = yield self._start_close(exporter, spider)
+        assert not close_d.called
+        GatedFileFeedStorage.release("/feeds/2.jl")
+        yield close_d
+        assert (
+            crawler.stats.get_value("feedexport/success_count/GatedFileFeedStorage")
+            == 1
+        )
+        assert GatedFileFeedStorage.stored == [
+            ("/feeds/2.jl", b'{"foo": "bar3"}\n{"foo": "bar4"}\n')
+        ]
+
+    @defer.inlineCallbacks
+    def test_crawlers_are_isolated(self):
+        exporter_a, crawler_a, spider_a = self._build_exporter(
+            {
+                "gated:/a/%(batch_id)d.jl": {
+                    "format": "jsonlines",
+                    "batch_item_count": 1,
+                }
+            },
+            max_pending_batches=1,
+        )
+        exporter_b, crawler_b, spider_b = self._build_exporter(
+            {
+                "gated:/b/%(batch_id)d.jl": {
+                    "format": "jsonlines",
+                    "batch_item_count": 1,
+                }
+            },
+            max_pending_batches=1,
+        )
+        assert exporter_a.item_scraped({"foo": "a1"}, spider_a) is None
+        blocked_a = exporter_a.item_scraped({"foo": "a2"}, spider_a)
+        assert blocked_a is not None
+        assert not blocked_a.called
+
+        # Crawler B still has storage capacity of its own.
+        assert exporter_b.item_scraped({"foo": "b1"}, spider_b) is None
+        blocked_b = exporter_b.item_scraped({"foo": "b2"}, spider_b)
+        assert blocked_b is not None
+        assert not blocked_b.called
+
+        # A finished store of crawler A only unblocks crawler A.
+        GatedFileFeedStorage.release("/a/1.jl")
+        assert blocked_a.called
+        assert not blocked_b.called
+
+        # Closing crawler A only waits for its own pending stores.
+        close_a = yield self._start_close(exporter_a, spider_a)
+        assert not close_a.called
+        GatedFileFeedStorage.release("/a/2.jl")
+        yield close_a
+        assert not blocked_b.called
+
+        GatedFileFeedStorage.release("/b/1.jl")
+        assert blocked_b.called
+        close_b = yield self._start_close(exporter_b, spider_b)
+        assert not close_b.called
+        GatedFileFeedStorage.release("/b/2.jl")
+        yield close_b
+
+        assert (
+            crawler_a.stats.get_value("feedexport/success_count/GatedFileFeedStorage")
+            == 2
+        )
+        assert (
+            crawler_b.stats.get_value("feedexport/success_count/GatedFileFeedStorage")
+            == 2
+        )
+
+    @defer.inlineCallbacks
+    def test_multiple_feeds_and_sync_storage(self):
+        temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        exporter, crawler, spider = self._build_exporter(
+            {
+                str(Path(temp_dir) / "sync-%(batch_id)d.jl"): {
+                    "format": "jsonlines",
+                    "batch_item_count": 1,
+                },
+                "gated:/multi/%(batch_id)d.jl": {
+                    "format": "jsonlines",
+                    "batch_item_count": 1,
+                },
+            },
+            max_pending_batches=1,
+        )
+        # The feed with a synchronous storage is stored right away, only
+        # the gated feed reaches the pending-batch limit.
+        assert exporter.item_scraped({"foo": "bar1"}, spider) is None
+        blocked = exporter.item_scraped({"foo": "bar2"}, spider)
+        assert blocked is not None
+        assert not blocked.called
+        GatedFileFeedStorage.release("/multi/1.jl")
+        assert blocked.called
+
+        close_d = yield self._start_close(exporter, spider)
+        assert not close_d.called
+        GatedFileFeedStorage.release("/multi/2.jl")
+        yield close_d
+
+        assert GatedFileFeedStorage.stored == [
+            ("/multi/1.jl", b'{"foo": "bar1"}\n'),
+            ("/multi/2.jl", b'{"foo": "bar2"}\n'),
+        ]
+        assert (Path(temp_dir) / "sync-1.jl").read_bytes() == b'{"foo": "bar1"}\n'
+        assert (Path(temp_dir) / "sync-2.jl").read_bytes() == b'{"foo": "bar2"}\n'
+
+    @defer.inlineCallbacks
+    def test_default_is_unlimited(self):
+        exporter, crawler, spider = self._build_exporter(
+            {
+                "gated:/feeds/%(batch_id)d.jl": {
+                    "format": "jsonlines",
+                    "batch_item_count": 2,
+                }
+            },
+        )
+        for i in range(1, 13):
+            assert exporter.item_scraped({"foo": f"bar{i}"}, spider) is None
+        # All 6 batches are closed without waiting for any store to finish.
+        assert len(GatedFileFeedStorage.gates) == 6
+
+        close_d = yield self._start_close(exporter, spider)
+        assert not close_d.called
+        for batch_id in range(1, 7):
+            GatedFileFeedStorage.release(f"/feeds/{batch_id}.jl")
+        yield close_d
+        assert len(GatedFileFeedStorage.stored) == 6
+
+    @defer.inlineCallbacks
+    def test_crawl(self):
+        class TestSpider(scrapy.Spider):
+            name = "testspider"
+
+            def parse(self, response):
+                for i in range(1, 13):
+                    yield {"foo": f"bar{i}"}
+
+        settings = {
+            "FEEDS": {
+                "gated:/feeds/%(batch_id)d.jl": {
+                    "format": "jsonlines",
+                    "batch_item_count": 2,
+                }
+            },
+            "FEED_STORAGES": {"gated": GatedFileFeedStorage},
+            "FEED_EXPORT_MAX_PENDING_BATCHES": 2,
+        }
+        TestSpider.start_urls = [self.mockserver.url("/")]
+        crawler = get_crawler(TestSpider, settings)
+        crawl_d = crawler.crawl()
+        max_pending = 0
+        while not crawl_d.called:
+            max_pending = max(max_pending, len(GatedFileFeedStorage.gates))
+            while GatedFileFeedStorage.gates:
+                GatedFileFeedStorage.release(GatedFileFeedStorage.gates[0].path)
+            yield task.deferLater(reactor, 0.001)
+        yield crawl_d
+        # The crawl applied backpressure instead of closing all 6 batches.
+        assert max_pending == 2
+        stored = dict(GatedFileFeedStorage.stored)
+        assert sorted(stored) == [f"/feeds/{batch_id}.jl" for batch_id in range(1, 7)]
 
 
 class TestFeedExportInit:
