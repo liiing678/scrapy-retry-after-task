@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+from time import time
 from typing import TYPE_CHECKING, Self
 
 from scrapy import Request, Spider, signals
 from scrapy.exceptions import NotConfigured
+from scrapy.extensions.httpcache import rfc1123_to_epoch
 from scrapy.utils.response import _body_size
 
 if TYPE_CHECKING:
@@ -16,11 +18,36 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+_RETRY_AFTER_STATUSES = (429, 503)
+
+
+def _retry_after_delay(response: Response) -> float | None:
+    """Return how many seconds the Retry-After header of *response* asks to
+    wait, or None if there is no valid header to honor."""
+    if response.status not in _RETRY_AFTER_STATUSES:
+        return None
+    header = response.headers.get("Retry-After")
+    if header is None:
+        return None
+    try:
+        return max(0.0, float(header))
+    except ValueError:
+        pass
+    epoch = rfc1123_to_epoch(header)
+    if epoch is None:
+        return None
+    return max(0.0, epoch - time())
+
+
 class AutoThrottle:
     def __init__(self, crawler: Crawler):
         self.crawler: Crawler = crawler
         if not crawler.settings.getbool("AUTOTHROTTLE_ENABLED"):
             raise NotConfigured
+
+        # Download slot key → wall-clock time until which the slot is waiting
+        # out a Retry-After response and its delay is not adjusted.
+        self._retry_after: dict[str, float] = {}
 
         self.debug: bool = crawler.settings.getbool("AUTOTHROTTLE_DEBUG")
         self.target_concurrency: float = crawler.settings.getfloat(
@@ -67,6 +94,17 @@ class AutoThrottle:
             or request.meta.get("autothrottle_dont_adjust_delay", False) is True
         ):
             return
+
+        assert key is not None
+        retry_after = _retry_after_delay(response)
+        if retry_after is not None:
+            delay = min(retry_after, self.maxdelay)
+            slot.delay = max(slot.delay, delay)
+            self._retry_after[key] = time() + delay
+            return
+        if self._retry_after.get(key, 0.0) > time():
+            return
+        self._retry_after.pop(key, None)
 
         olddelay = slot.delay
         self._adjust_delay(slot, latency, response)

@@ -1,3 +1,4 @@
+from email.utils import formatdate
 from logging import INFO
 from typing import Any
 from unittest.mock import Mock
@@ -7,6 +8,7 @@ import pytest
 from scrapy import Request, Spider
 from scrapy.crawler import Crawler
 from scrapy.exceptions import NotConfigured
+from scrapy.extensions import throttle
 from scrapy.extensions.throttle import AutoThrottle
 from scrapy.http.response import Response
 from scrapy.settings.default_settings import (
@@ -35,6 +37,28 @@ def _mock_downloader(crawler: Crawler) -> Mock:
     downloader: Mock = crawler.engine.downloader
     downloader.slots = {}
     return downloader
+
+
+class _FrozenClock:
+    def __init__(self, now: float = 1_000_000.0):
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _throttle(settings: dict[str, Any] | None = None):
+    crawler = get_crawler(settings)
+    at = build_from_crawler(AutoThrottle, crawler)
+    downloader = _mock_downloader(crawler)
+    spider = DefaultSpider.from_crawler(crawler)
+    at._spider_opened(spider)
+    return at, downloader, spider
+
+
+def _request(slot: str = "foo", latency: float = 1.0) -> Request:
+    meta = {"download_latency": latency, "download_slot": slot}
+    return Request("https://example.com", meta=meta)
 
 
 @pytest.mark.parametrize(
@@ -321,3 +345,123 @@ def test_debug_disabled(caplog):
         at._response_downloaded(response, request, spider)
 
     assert caplog.record_tuples == []
+
+
+def test_retry_after_seconds(monkeypatch):
+    clock = _FrozenClock()
+    monkeypatch.setattr(throttle, "time", clock)
+    at, downloader, spider = _throttle()
+    slot = Mock()
+    slot.delay = 1.0
+    downloader.slots["foo"] = slot
+    request = _request()
+    response = Response(request.url, status=429, headers={"Retry-After": "5"})
+
+    at._response_downloaded(response, request, spider)
+
+    assert slot.delay == 5.0
+
+
+def test_retry_after_http_date(monkeypatch):
+    clock = _FrozenClock()
+    monkeypatch.setattr(throttle, "time", clock)
+    at, downloader, spider = _throttle()
+    slot = Mock()
+    slot.delay = 1.0
+    downloader.slots["foo"] = slot
+    request = _request()
+    date = formatdate(clock.now + 10, usegmt=True)
+    response = Response(request.url, status=503, headers={"Retry-After": date})
+
+    at._response_downloaded(response, request, spider)
+
+    assert slot.delay == 10.0
+
+
+def test_retry_after_max_delay(monkeypatch):
+    clock = _FrozenClock()
+    monkeypatch.setattr(throttle, "time", clock)
+    at, downloader, spider = _throttle({"AUTOTHROTTLE_MAX_DELAY": 3.0})
+    slot = Mock()
+    slot.delay = 1.0
+    downloader.slots["foo"] = slot
+    request = _request()
+    response = Response(request.url, status=429, headers={"Retry-After": "10"})
+
+    at._response_downloaded(response, request, spider)
+
+    assert slot.delay == 3.0
+
+    # The backoff ends with the capped delay, not the header value.
+    clock.now += 4
+    at._response_downloaded(Response(request.url), request, spider)
+    assert slot.delay == 2.0
+
+
+def test_retry_after_slot_isolation(monkeypatch):
+    clock = _FrozenClock()
+    monkeypatch.setattr(throttle, "time", clock)
+    at, downloader, spider = _throttle()
+    foo = Mock()
+    foo.delay = 1.0
+    bar = Mock()
+    bar.delay = 1.0
+    downloader.slots["foo"] = foo
+    downloader.slots["bar"] = bar
+    request = _request("foo")
+    response = Response(request.url, status=429, headers={"Retry-After": "10"})
+
+    at._response_downloaded(response, request, spider)
+
+    assert foo.delay == 10.0
+
+    # Other slots keep following the regular adjustment rules.
+    at._response_downloaded(Response(request.url), _request("bar", 2.0), spider)
+    assert bar.delay == 2.0
+
+
+def test_retry_after_recovery(monkeypatch):
+    clock = _FrozenClock()
+    monkeypatch.setattr(throttle, "time", clock)
+    at, downloader, spider = _throttle()
+    slot = Mock()
+    slot.delay = 1.0
+    downloader.slots["foo"] = slot
+    request = _request()
+    response = Response(request.url, status=503, headers={"Retry-After": "10"})
+    at._response_downloaded(response, request, spider)
+    assert slot.delay == 10.0
+
+    # While waiting out the Retry-After response, fast responses do not
+    # lower the delay.
+    clock.now += 5
+    at._response_downloaded(Response(request.url), _request(latency=0.1), spider)
+    assert slot.delay == 10.0
+
+    # Once it expires, the regular adjustment rules apply again.
+    clock.now += 6
+    at._response_downloaded(Response(request.url), _request(latency=0.1), spider)
+    assert slot.delay == 5.05
+
+
+@pytest.mark.parametrize(
+    ("status", "headers"),
+    [
+        (200, {"Retry-After": "10"}),
+        (429, {}),
+        (429, {"Retry-After": "not-a-date"}),
+    ],
+)
+def test_retry_after_ignored(status, headers, monkeypatch):
+    clock = _FrozenClock()
+    monkeypatch.setattr(throttle, "time", clock)
+    at, downloader, spider = _throttle()
+    slot = Mock()
+    slot.delay = 1.0
+    downloader.slots["foo"] = slot
+    request = _request(latency=2.0)
+    response = Response(request.url, status=status, headers=headers)
+
+    at._response_downloaded(response, request, spider)
+
+    assert slot.delay == 2.0
