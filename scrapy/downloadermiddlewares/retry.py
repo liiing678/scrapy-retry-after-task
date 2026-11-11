@@ -9,13 +9,17 @@ RETRY_HTTP_CODES - which HTTP response codes to retry
 
 from __future__ import annotations
 
+from datetime import UTC
+from email.utils import parsedate_to_datetime
 from logging import Logger, getLevelNamesMapping, getLogger
+from time import time
 from typing import TYPE_CHECKING, Self
 
+from scrapy import Spider, signals
 from scrapy.exceptions import NotConfigured
 from scrapy.utils.decorators import _warn_spider_arg
 from scrapy.utils.misc import _load_objects
-from scrapy.utils.python import global_object_name
+from scrapy.utils.python import global_object_name, to_unicode
 from scrapy.utils.response import response_status_message
 
 if TYPE_CHECKING:
@@ -27,6 +31,33 @@ if TYPE_CHECKING:
 
 
 retry_logger = getLogger(__name__)
+
+
+def _parse_retry_after(value: str | bytes | None) -> float | None:
+    """Return the delay in seconds asked by a Retry-After header *value*.
+
+    The header carries either a number of seconds or an HTTP date. Dates are
+    measured against the wall clock, so that a response generated before the
+    request reached this process is handled like a zero delay. Anything that is
+    neither a non-negative number nor a valid date is ignored.
+    """
+    if not value:
+        return None
+    value = to_unicode(value, encoding="latin1").strip()
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            date = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if date.tzinfo is None:
+            # HTTP dates always use GMT; an asctime()-format date has no zone.
+            date = date.replace(tzinfo=UTC)
+        seconds = date.timestamp() - time()
+    if seconds < 0:
+        return None
+    return seconds
 
 
 def get_retry_request(
@@ -147,12 +178,38 @@ class RetryMiddleware:
         self.priority_adjust = settings.getint("RETRY_PRIORITY_ADJUST")
         self.give_up_log_level = settings["RETRY_GIVE_UP_LOG_LEVEL"]
         self.exceptions_to_retry = _load_objects(settings.getlist("RETRY_EXCEPTIONS"))
+        self.retry_after_cooldown_enabled = settings.getbool(
+            "RETRY_AFTER_COOLDOWN_ENABLED"
+        )
+        self.retry_after_cooldown_max_delay = settings.getfloat(
+            "RETRY_AFTER_COOLDOWN_MAX_DELAY"
+        )
+        self._retry_after_statuses = self.retry_http_codes & {429, 503}
 
     @classmethod
     def from_crawler(cls, crawler: Crawler) -> Self:
         o = cls(crawler.settings)
         o.crawler = crawler
+        # The signal fires inside the downloader, before the transfer of the
+        # request ends and its slot is offered back to queued requests, which
+        # is when the cooldown has to be in place for them to honor it.
+        if o.retry_after_cooldown_enabled:
+            crawler.signals.connect(
+                o._response_downloaded, signal=signals.response_downloaded
+            )
         return o
+
+    def _response_downloaded(
+        self, response: Response, request: Request, spider: Spider
+    ) -> None:
+        if (
+            response.status not in self._retry_after_statuses
+            or request.meta.get("dont_retry", False)
+            or request.meta.get("retry_times", 0)
+            >= request.meta.get("max_retry_times", self.max_retry_times)
+        ):
+            return
+        self._apply_retry_after_cooldown(request, response)
 
     @_warn_spider_arg
     def process_response(
@@ -167,6 +224,21 @@ class RetryMiddleware:
             reason = response_status_message(response.status)
             return self._retry(request, reason) or response
         return response
+
+    def _apply_retry_after_cooldown(self, request: Request, response: Response) -> None:
+        """Hold the download slot of *request* back for the Retry-After header
+        of *response*, if it carries a usable value.
+        """
+        delay = _parse_retry_after(response.headers.get("Retry-After"))
+        if delay is None:
+            return
+        if self.retry_after_cooldown_max_delay:
+            delay = min(delay, self.retry_after_cooldown_max_delay)
+        self.crawler.engine.downloader._set_slot_cooldown(request, delay)
+        retry_logger.debug(
+            f"Cooling down download slot for {delay:g}s after "
+            f"Retry-After on {request.url}"
+        )
 
     @_warn_spider_arg
     def process_exception(

@@ -205,6 +205,8 @@ __all__ = [
     "REQUEST_FINGERPRINTER_CLASS",
     "RESPONSE_MAX_ACTIVE_SIZE",
     "RESPONSE_ROUGH_SIZE",
+    "RETRY_AFTER_COOLDOWN_ENABLED",
+    "RETRY_AFTER_COOLDOWN_MAX_DELAY",
     "RETRY_ENABLED",
     "RETRY_EXCEPTIONS",
     "RETRY_GIVE_UP_LOG_LEVEL",
@@ -579,6 +581,9 @@ REMOTE_CONTROL_TRACEBACK_MAX_BYTES = 16 * 1024
 
 REQUEST_FINGERPRINTER_CLASS = "scrapy.utils.request.RequestFingerprinter"
 
+RETRY_AFTER_COOLDOWN_ENABLED = False
+# 0 disables the cap: a Retry-After value is waited for as given.
+RETRY_AFTER_COOLDOWN_MAX_DELAY = 0.0
 RETRY_ENABLED = True
 RETRY_EXCEPTIONS = [
     "scrapy.exceptions.CannotResolveHostError",

@@ -968,3 +968,310 @@ async def test_request_body_producer() -> None:
     # The body is written in a single call, so there is nothing to pause or stop.
     producer.pauseProducing()
     producer.stopProducing()
+
+
+class TestSlotCooldown:
+    """Retry-After cooldowns, applied through Downloader._set_slot_cooldown()."""
+
+    @coroutine_test
+    async def test_queued_request_waits_for_cooldown(self) -> None:
+        downloader = _downloader()
+        request = Request("data:,", meta={"download_slot": "example.com"})
+        try:
+            downloader._set_slot_cooldown(request, 0.3)
+            slot = downloader.slots["example.com"]
+            assert slot.cooldown_call is not None
+            start = monotonic()
+            await maybe_deferred_to_future(downloader.fetch(request))
+        finally:
+            downloader.close()
+        assert monotonic() - start >= 0.3 - _DELAY_TOLERANCE
+
+    @coroutine_test
+    async def test_concurrent_responses_extend_cooldown(self) -> None:
+        downloader = _downloader()
+        request = Request("data:,", meta={"download_slot": "example.com"})
+        try:
+            downloader._set_slot_cooldown(request, 0.5)
+            slot = downloader.slots["example.com"]
+            first_call = slot.cooldown_call
+            # A second, longer cooldown replaces the timer of the first one and
+            # its deadline wins, even once the first timer would have fired.
+            downloader._set_slot_cooldown(request, 0.3)
+            assert slot.cooldown_call is first_call
+            downloader._set_slot_cooldown(request, 0.6)
+            assert slot.cooldown_call is not first_call
+            start = monotonic()
+            await maybe_deferred_to_future(downloader.fetch(request))
+        finally:
+            downloader.close()
+        assert monotonic() - start >= 0.6 - _DELAY_TOLERANCE
+
+    @coroutine_test
+    async def test_shorter_cooldown_does_not_shorten(self) -> None:
+        downloader = _downloader()
+        request = Request("data:,", meta={"download_slot": "example.com"})
+        try:
+            downloader._set_slot_cooldown(request, 0.4)
+            slot = downloader.slots["example.com"]
+            first_call = slot.cooldown_call
+            downloader._set_slot_cooldown(request, 0.1)
+            assert slot.cooldown_call is first_call
+            start = monotonic()
+            await maybe_deferred_to_future(downloader.fetch(request))
+        finally:
+            downloader.close()
+        assert monotonic() - start >= 0.4 - _DELAY_TOLERANCE
+
+    @coroutine_test
+    async def test_other_slots_keep_going(self) -> None:
+        downloader = _downloader()
+        cooled = Request("data:,", meta={"download_slot": "cooled.example"})
+        moving = Request("data:,", meta={"download_slot": "moving.example"})
+        try:
+            downloader._set_slot_cooldown(cooled, 1.0)
+            start = monotonic()
+            response = await maybe_deferred_to_future(downloader.fetch(moving))
+            elapsed = monotonic() - start
+        finally:
+            downloader.close()
+        assert isinstance(response, Response)
+        assert response.status == 200
+        # The cooldown of one slot never blocks a request for another slot.
+        assert elapsed < 0.5
+
+    @coroutine_test
+    async def test_close_cancels_cooldown_and_drops_queued_requests(self) -> None:
+        crawler = get_crawler(DefaultSpider, {"DOWNLOADER_MIDDLEWARES_BASE": {}})
+        crawler.spider = crawler._create_spider()
+        downloader = Downloader(crawler)
+        slot = Slot(concurrency=1, delay=0, jitter=0)
+        downloader.slots["example.com"] = slot
+        downloader._set_slot_cooldown(
+            Request("https://example.com", meta={"download_slot": "example.com"}),
+            10.0,
+        )
+        assert slot.cooldown_call is not None
+
+        queue_dfd: Deferred[Any] = Deferred()
+        failures: list[Failure] = []
+        queue_dfd.addErrback(failures.append)
+        slot.queue.append((Request("https://example.com"), queue_dfd))
+
+        dropped = await downloader.stop()
+        assert dropped == 1
+        assert slot.cooldown_call is None
+        assert len(failures) == 1
+        assert failures[0].check(DownloadCancelledError)
+
+    def test_zero_delay_is_ignored(self) -> None:
+        downloader = _downloader()
+        try:
+            downloader._set_slot_cooldown(
+                Request("data:,", meta={"download_slot": "example.com"}), 0
+            )
+            assert not downloader.slots
+        finally:
+            downloader.close()
+
+    @coroutine_test
+    async def test_cooldown_after_shutdown_is_ignored(self) -> None:
+        downloader = _downloader()
+        downloader.close()
+        downloader._set_slot_cooldown(
+            Request("data:,", meta={"download_slot": "example.com"}), 1.0
+        )
+        assert not downloader.slots
+
+
+class _RetryAfterSpider(MockServerSpider):
+    """Fetches a path that answers 429 with a Retry-After header once, and
+    another request that must wait for the cooldown before it is sent."""
+
+    name = "retry_after"
+    custom_settings = {
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 1,
+        "RETRY_AFTER_COOLDOWN_ENABLED": True,
+    }
+
+    def __init__(self, *args: Any, cooldown: float = 0.5, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.cooldown = cooldown
+        self.times: dict[str, float] = {}
+        self.start_time = monotonic()
+
+    async def start(self):
+        assert self.mockserver
+        base = self.mockserver.url
+        # Both go to the same download slot. The first one is being transferred
+        # when the second one enters the slot queue.
+        yield Request(base(f"/retry-after?r={self.cooldown:g}"), meta={"key": "first"})
+        yield Request(base("/status?n=200"), meta={"key": "queued"})
+
+    def parse(self, response):
+        self.times[response.meta["key"]] = monotonic() - self.start_time
+
+
+@coroutine_test
+async def test_retry_after_cooldown_holds_queued_request(
+    mockserver: MockServer,
+) -> None:
+    crawler = get_crawler(_RetryAfterSpider)
+    await crawler.crawl_async(mockserver=mockserver, cooldown=0.5)
+    spider = crawler.spider
+    assert isinstance(spider, _RetryAfterSpider)
+    # Neither request could be sent before the cooldown was over, even though
+    # the 429 response had already freed the only transfer slot.
+    assert spider.times["queued"] >= 0.5 - _DELAY_TOLERANCE
+    assert spider.times["first"] >= 0.5 - _DELAY_TOLERANCE
+    assert crawler.stats is not None
+    assert crawler.stats.get_value("retry/count") == 1
+
+
+class _RetryAfterOtherSlotSpider(MockServerSpider):
+    name = "retry_after_other_slot"
+    custom_settings = {
+        "CONCURRENT_REQUESTS": 2,
+        "RETRY_AFTER_COOLDOWN_ENABLED": True,
+    }
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.other_slot_time: float | None = None
+        self.start_time = monotonic()
+
+    async def start(self):
+        assert self.mockserver
+        yield Request(self.mockserver.url("/retry-after?r=1"))
+        # A different host means a different download slot.
+        yield Request(
+            self.mockserver.url("/status?n=200"),
+            meta={"download_slot": "other.example"},
+        )
+
+    def parse(self, response):
+        if response.meta.get("download_slot") == "other.example":
+            self.other_slot_time = monotonic() - self.start_time
+
+
+@coroutine_test
+async def test_retry_after_cooldown_is_per_slot(
+    mockserver: MockServer,
+) -> None:
+    crawler = get_crawler(_RetryAfterOtherSlotSpider)
+    await crawler.crawl_async(mockserver=mockserver)
+    spider = crawler.spider
+    assert isinstance(spider, _RetryAfterOtherSlotSpider)
+    # The other slot kept moving and did not wait for the cooled-down slot.
+    assert spider.other_slot_time is not None
+    assert spider.other_slot_time < 0.5
+
+
+class _ConcurrentRetryAfterSpider(MockServerSpider):
+    """Two concurrent requests both get 429 with Retry-After; the later,
+    longer cooldown must extend the deadline for both retries."""
+
+    name = "retry_after_concurrent"
+    custom_settings = {
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 2,
+        "RETRY_AFTER_COOLDOWN_ENABLED": True,
+    }
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.retry_times: list[float] = []
+        self.start_time = monotonic()
+
+    async def start(self):
+        assert self.mockserver
+        yield Request(self.mockserver.url("/retry-after?r=0.4&k=1&t=short"))
+        yield Request(self.mockserver.url("/retry-after?r=0.8&k=1&t=long"))
+
+    def parse(self, response):
+        if response.status == 200:
+            self.retry_times.append(monotonic() - self.start_time)
+
+
+@coroutine_test
+async def test_retry_after_concurrent_responses_extend_cooldown(
+    mockserver: MockServer,
+) -> None:
+    crawler = get_crawler(_ConcurrentRetryAfterSpider)
+    await crawler.crawl_async(mockserver=mockserver)
+    spider = crawler.spider
+    assert isinstance(spider, _ConcurrentRetryAfterSpider)
+    # Both retries went out only after the longest (0.8s) cooldown elapsed.
+    assert len(spider.retry_times) == 2
+    assert min(spider.retry_times) >= 0.8 - _DELAY_TOLERANCE
+
+
+class _CooldownThenStopSpider(MockServerSpider):
+    """Gets a 429 with a long cooldown; the crawl stops on the response instead
+    of waiting for the cooldown timer."""
+
+    name = "retry_after_stop"
+    custom_settings = {
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 1,
+        "RETRY_AFTER_COOLDOWN_ENABLED": True,
+    }
+
+    async def start(self):
+        assert self.mockserver
+        yield Request(self.mockserver.url("/retry-after?r=30"))
+
+    def parse(self, response):
+        pass
+
+
+@coroutine_test
+async def test_retry_after_cooldown_cancelled_on_stop(
+    mockserver: MockServer,
+) -> None:
+    crawler = get_crawler(_CooldownThenStopSpider)
+    crawl_dfd = deferred_from_coro(crawler.crawl_async(mockserver=mockserver))
+
+    def stop_on_response(response: Response, request: Request) -> None:
+        _schedule_coro(crawler.stop_async(mode="fast"))
+
+    crawler.signals.connect(stop_on_response, signal=signals.response_downloaded)
+    start = monotonic()
+    await maybe_deferred_to_future(crawl_dfd)
+    # The crawl ends immediately rather than waiting for the 30s cooldown.
+    assert monotonic() - start < 5
+    downloader = crawler.engine.downloader
+    assert all(slot.cooldown_call is None for slot in downloader.slots.values())
+
+
+class _CappedRetryAfterSpider(MockServerSpider):
+    """A Retry-After longer than RETRY_AFTER_COOLDOWN_MAX_DELAY is shortened."""
+
+    name = "retry_after_cap"
+    custom_settings = {
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 1,
+        "RETRY_AFTER_COOLDOWN_ENABLED": True,
+        "RETRY_AFTER_COOLDOWN_MAX_DELAY": 0.3,
+    }
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.retry_time: float | None = None
+        self.start_time = monotonic()
+
+    async def start(self):
+        assert self.mockserver
+        yield Request(self.mockserver.url("/retry-after?r=10"))
+
+    def parse(self, response):
+        if response.status == 200:
+            self.retry_time = monotonic() - self.start_time
+
+
+@coroutine_test
+async def test_retry_after_cooldown_is_capped(mockserver: MockServer) -> None:
+    crawler = get_crawler(_CappedRetryAfterSpider)
+    await crawler.crawl_async(mockserver=mockserver)
+    spider = crawler.spider
+    assert isinstance(spider, _CappedRetryAfterSpider)
+    assert spider.retry_time is not None
+    # The cap applies, so the retry waits ~0.3s rather than the 10s header.
+    assert 0.3 - _DELAY_TOLERANCE <= spider.retry_time < 5

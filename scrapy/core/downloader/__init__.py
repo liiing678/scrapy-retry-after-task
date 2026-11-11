@@ -97,6 +97,10 @@ class Slot:
     transferring: set[Request] = field(default_factory=set, init=False, repr=False)
     lastseen: float = field(default=0, init=False, repr=False)
     latercall: CallLaterResult | None = field(default=None, init=False, repr=False)
+    # Monotonic time until which _process_queue() must not start a transfer,
+    # set from a Retry-After response, and the timer that resumes the queue.
+    cooldown_until: float = field(default=0.0, init=False, repr=False)
+    cooldown_call: CallLaterResult | None = field(default=None, init=False, repr=False)
     # Number of requests in queue not sent with
     # ExecutionEngine.download_async().
     _scheduled_queued: int = field(default=0, init=False, repr=False)
@@ -131,6 +135,8 @@ class Slot:
         self.transferring = set()
         self.lastseen = 0
         self.latercall = None
+        self.cooldown_until = 0.0
+        self.cooldown_call = None
         self._scheduled_queued = 0
 
     @property
@@ -164,6 +170,9 @@ class Slot:
         if self.latercall:
             self.latercall.cancel()
             self.latercall = None
+        if self.cooldown_call:
+            self.cooldown_call.cancel()
+            self.cooldown_call = None
 
     def __str__(self) -> str:
         return (
@@ -522,6 +531,16 @@ class Downloader:
                 slot.latercall = call_later(penalty, self._latercall, slot)
                 return
 
+        if slot.cooldown_until > now:
+            # A Retry-After response is holding the slot back. Requests keep
+            # their place in the queue and take no concurrency spot while they
+            # wait for the timer to resume processing.
+            if slot.cooldown_call is None:
+                slot.cooldown_call = call_later(
+                    slot.cooldown_until - now, self._cooldown_timeout, slot
+                )
+            return
+
         # Process enqueued requests if there are free slots to transfer for this slot
         while slot.queue and slot.free_transfer_slots() > 0:
             index = self._next_transfer_index(slot)
@@ -571,6 +590,39 @@ class Downloader:
 
     def _latercall(self, slot: Slot) -> None:
         slot.latercall = None
+        self._process_queue(slot)
+
+    def _set_slot_cooldown(self, request: Request, delay: float) -> None:
+        """Hold the download slot of *request* back for *delay* seconds.
+
+        Called from the retry middleware after a 429 or 503 response that is
+        being retried carries a Retry-After header. Only requests that have not
+        been sent yet are held: the response that triggered the cooldown has
+        finished its transfer, and other in-flight requests to the same slot
+        run to completion.
+        """
+        if not self._accepting_requests or delay <= 0:
+            return
+        _, slot = self._get_slot(request)
+        new_until = monotonic() + delay
+        if new_until <= slot.cooldown_until:
+            return
+        slot.cooldown_until = new_until
+        # A timer scheduled for an earlier, superseded deadline would fire too
+        # soon and find the cooldown still active; replace it with one for the
+        # new deadline instead.
+        if slot.cooldown_call is not None:
+            slot.cooldown_call.cancel()
+            slot.cooldown_call = None
+        self._process_queue(slot)
+
+    def _cooldown_timeout(self, slot: Slot) -> None:
+        slot.cooldown_call = None
+        if monotonic() < slot.cooldown_until:
+            # Another response extended the cooldown after this timer was set;
+            # _set_slot_cooldown() replaced it with one for the new deadline.
+            return
+        slot.cooldown_until = 0.0
         self._process_queue(slot)
 
     async def _download(self, slot: Slot, request: Request) -> Response:

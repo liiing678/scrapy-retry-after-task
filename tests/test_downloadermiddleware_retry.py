@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime, timedelta
+from email.utils import formatdate
+from time import time
 from typing import TYPE_CHECKING, Any, cast
+from unittest.mock import MagicMock
 from urllib.parse import urlencode
 
 import pytest
 from twisted.internet.error import ConnectError, ConnectionDone, ConnectionLost
 
+from scrapy import signals
 from scrapy.core.scheduler import Scheduler
-from scrapy.downloadermiddlewares.retry import RetryMiddleware, get_retry_request
+from scrapy.downloadermiddlewares.retry import (
+    RetryMiddleware,
+    _parse_retry_after,
+    get_retry_request,
+)
 from scrapy.exceptions import (
     CannotResolveHostError,
     DownloadConnectionRefusedError,
@@ -831,3 +840,163 @@ async def test_retry_redirect_dupefilter_legacy_scheduler(
     assert sum("supports_skip_dupefilter_once" in str(w.message) for w in record) == 1
     assert crawler.spider is not None
     assert cast("_RetryThenRedirectSpider", crawler.spider).seen_parsed == 3
+
+
+class TestParseRetryAfter:
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (b"120", 120.0),
+            ("5", 5.0),
+            (b"  10  ", 10.0),
+            (b"0.25", 0.25),
+            (b"0", 0.0),
+        ],
+    )
+    def test_seconds(self, value: str | bytes, expected: float) -> None:
+        assert _parse_retry_after(value) == expected
+
+    def test_http_date_in_the_future(self) -> None:
+        value = formatdate(time() + 60, usegmt=True)
+        assert _parse_retry_after(value) == pytest.approx(60, abs=1)
+
+    def test_naive_http_date_is_treated_as_gmt(self) -> None:
+        value = (datetime.now(UTC) + timedelta(seconds=30)).strftime(
+            "%a %b %d %H:%M:%S %Y"
+        )
+        assert _parse_retry_after(value) == pytest.approx(30, abs=1)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            None,
+            b"",
+            b"not-a-date",
+            b"-5",
+            b"1.2.3",
+            formatdate(time() - 60, usegmt=True),
+        ],
+    )
+    def test_invalid_or_past_values_are_ignored(self, value: Any) -> None:
+        assert _parse_retry_after(value) is None
+
+
+class TestRetryAfterCooldown:
+    def _middleware(self, **settings: Any) -> RetryMiddleware:
+        crawler = get_crawler(
+            DefaultSpider,
+            {"RETRY_AFTER_COOLDOWN_ENABLED": True, **settings},
+        )
+        crawler.spider = crawler._create_spider()
+        crawler.engine = MagicMock()
+        return build_from_crawler(RetryMiddleware, crawler)
+
+    @staticmethod
+    def _response(status: int, retry_after: bytes | None = None) -> Response:
+        headers = {}
+        if retry_after is not None:
+            headers["Retry-After"] = retry_after
+        return Response(
+            "http://www.scrapytest.org/x",
+            body=b"",
+            status=status,
+            headers=headers,
+        )
+
+    def _emit(self, mw: RetryMiddleware, request: Request, response: Response) -> None:
+        # Mirrors the response_downloaded signal the downloader sends before
+        # ending the transfer of the request.
+        assert mw.crawler.spider is not None
+        mw._response_downloaded(response, request, mw.crawler.spider)
+
+    @staticmethod
+    def _cooldown_mock(mw: RetryMiddleware) -> MagicMock:
+        return cast("MagicMock", mw.crawler.engine.downloader._set_slot_cooldown)
+
+    @pytest.mark.parametrize("status", [429, 503])
+    def test_cooldown_applied_on_retried_response(self, status: int) -> None:
+        mw = self._middleware()
+        request = Request("http://www.scrapytest.org/x")
+        self._emit(mw, request, self._response(status, b"7"))
+        self._cooldown_mock(mw).assert_called_once_with(request, 7.0)
+
+    def test_cooldown_capped_by_max_delay(self) -> None:
+        mw = self._middleware(RETRY_AFTER_COOLDOWN_MAX_DELAY=2.5)
+        request = Request("http://www.scrapytest.org/x")
+        self._emit(mw, request, self._response(429, b"10"))
+        self._cooldown_mock(mw).assert_called_once_with(request, 2.5)
+
+    def test_no_cooldown_without_retry_after_header(self) -> None:
+        mw = self._middleware()
+        request = Request("http://www.scrapytest.org/x")
+        self._emit(mw, request, self._response(429))
+        self._cooldown_mock(mw).assert_not_called()
+
+    @pytest.mark.parametrize("retry_after", [b"not-a-date", b"-3"])
+    def test_invalid_retry_after_is_ignored(self, retry_after: bytes) -> None:
+        mw = self._middleware()
+        request = Request("http://www.scrapytest.org/x")
+        self._emit(mw, request, self._response(503, retry_after))
+        self._cooldown_mock(mw).assert_not_called()
+
+    def test_dont_retry_skips_cooldown(self) -> None:
+        mw = self._middleware()
+        request = Request("http://www.scrapytest.org/x", meta={"dont_retry": True})
+        self._emit(mw, request, self._response(429, b"7"))
+        self._cooldown_mock(mw).assert_not_called()
+
+    def test_retries_exhausted_skip_cooldown(self) -> None:
+        mw = self._middleware()
+        mw.max_retry_times = 0
+        request = Request("http://www.scrapytest.org/x")
+        self._emit(mw, request, self._response(429, b"7"))
+        self._cooldown_mock(mw).assert_not_called()
+
+    def test_request_meta_max_retry_times_skips_cooldown(self) -> None:
+        mw = self._middleware()
+        request = Request(
+            "http://www.scrapytest.org/x",
+            meta={"retry_times": 1, "max_retry_times": 1},
+        )
+        self._emit(mw, request, self._response(429, b"7"))
+        self._cooldown_mock(mw).assert_not_called()
+
+    def test_other_retry_codes_skip_cooldown(self) -> None:
+        mw = self._middleware()
+        request = Request("http://www.scrapytest.org/x")
+        self._emit(mw, request, self._response(500, b"7"))
+        self._cooldown_mock(mw).assert_not_called()
+
+    def test_retry_behavior_is_unchanged(self) -> None:
+        # The cooldown path leaves retry bookkeeping to process_response():
+        # the request is still retried, with its priority adjusted.
+        mw = self._middleware()
+        request = Request("http://www.scrapytest.org/x")
+        result = mw.process_response(request, self._response(429, b"7"))
+        assert isinstance(result, Request)
+        assert result.meta["retry_times"] == 1
+        assert result.priority < request.priority
+
+    def test_signal_connected_only_when_enabled(self) -> None:
+        enabled_crawler = get_crawler(
+            DefaultSpider,
+            {"RETRY_AFTER_COOLDOWN_ENABLED": True},
+        )
+        enabled_crawler.signals = MagicMock()
+        enabled = RetryMiddleware.from_crawler(enabled_crawler)
+        enabled_crawler.signals.connect.assert_called_once_with(
+            enabled._response_downloaded,
+            signal=signals.response_downloaded,
+        )
+
+        disabled_crawler = get_crawler(DefaultSpider)
+        disabled_crawler.signals = MagicMock()
+        RetryMiddleware.from_crawler(disabled_crawler)
+        disabled_crawler.signals.connect.assert_not_called()
+
+    def test_disabled_by_default(self) -> None:
+        # With the setting off, from_crawler() does not connect the signal, so
+        # the cooldown code never runs; test_signal_connected_only_when_enabled
+        # covers that. The setting itself defaults to False.
+        crawler = get_crawler(DefaultSpider)
+        assert crawler.settings.getbool("RETRY_AFTER_COOLDOWN_ENABLED") is False

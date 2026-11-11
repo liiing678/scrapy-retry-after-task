@@ -1177,6 +1177,42 @@ To retry requests from a spider callback, you can use the
 RetryMiddleware Settings
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
+.. setting:: RETRY_AFTER_COOLDOWN_ENABLED
+
+RETRY_AFTER_COOLDOWN_ENABLED
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Default: ``False``
+
+.. versionadded:: VERSION
+
+Whether a ``Retry-After`` header on a retried 429 or 503 response holds the
+download slot (see :setting:`DOWNLOAD_SLOTS`) back for the requested time.
+
+The header is honored only when the response is retried. Requests that have
+not been sent yet to the same slot, including the retry of the response that
+carried the header, wait until the cooldown is over, while requests to other
+slots keep being downloaded and the cooldown takes no global concurrency
+slot. Requests already in flight are not stopped.
+
+The header value is either a number of seconds or an HTTP date. Invalid
+values and dates in the past are ignored. Use
+:setting:`RETRY_AFTER_COOLDOWN_MAX_DELAY` to cap how long a cooldown can last.
+
+.. setting:: RETRY_AFTER_COOLDOWN_MAX_DELAY
+
+RETRY_AFTER_COOLDOWN_MAX_DELAY
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Default: ``0``
+
+.. versionadded:: VERSION
+
+Maximum seconds a cooldown enabled with
+:setting:`RETRY_AFTER_COOLDOWN_ENABLED` can last. A ``Retry-After`` value
+above the cap is shortened to it. ``0`` means no cap, so the value is waited
+for as given.
+
 .. setting:: RETRY_ENABLED
 
 RETRY_ENABLED

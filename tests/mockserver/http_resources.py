@@ -218,6 +218,29 @@ class Status(LeafResource):
         return b""
 
 
+class RetryAfter(LeafResource):
+    """Answer the first *k* requests with the status code from *n* (429 by
+    default), each carrying a Retry-After header taken from *r*, then answer
+    further requests with 200.
+
+    *r* may be a number of seconds or an HTTP date, including values that are
+    not valid Retry-After headers, which tests need to verify are ignored.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts: dict[str, int] = {}
+
+    def render_GET(self, request: Request) -> bytes:
+        key = request.uri.decode()
+        attempt = self.attempts.get(key, 0) + 1
+        self.attempts[key] = attempt
+        if attempt <= getarg(request, b"k", 1, type_=int):
+            request.setResponseCode(getarg(request, b"n", 429, type_=int))
+            request.setHeader(b"Retry-After", getarg(request, b"r", b"1"))
+        return b""
+
+
 class Raw(LeafResource):
     def render_GET(self, request: Request) -> int:
         request.startedWriting = 1
